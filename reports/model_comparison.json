@@ -1,0 +1,86 @@
+[
+  {
+    "model": "Logistic Regression",
+    "threshold": 0.5,
+    "roc_auc": 0.5391319220663329,
+    "pr_auc": 0.12132666850201582,
+    "precision": 1.0,
+    "recall": 0.09130434782608696,
+    "f1": 0.16733067729083664,
+    "confusion_matrix": [
+      [
+        8770,
+        0
+      ],
+      [
+        209,
+        21
+      ]
+    ],
+    "n_samples": 9000,
+    "n_positive": 230
+  },
+  {
+    "model": "Random Forest",
+    "threshold": 0.5,
+    "roc_auc": 0.7174408804719646,
+    "pr_auc": 0.14754328760213178,
+    "precision": 1.0,
+    "recall": 0.09130434782608696,
+    "f1": 0.16733067729083664,
+    "confusion_matrix": [
+      [
+        8770,
+        0
+      ],
+      [
+        209,
+        21
+      ]
+    ],
+    "n_samples": 9000,
+    "n_positive": 230
+  },
+  {
+    "model": "XGBoost (tuned threshold)",
+    "threshold": 0.5263727307319641,
+    "roc_auc": 0.7113137672896733,
+    "pr_auc": 0.14435406786450933,
+    "precision": 1.0,
+    "recall": 0.09130434782608696,
+    "f1": 0.16733067729083664,
+    "confusion_matrix": [
+      [
+        8770,
+        0
+      ],
+      [
+        209,
+        21
+      ]
+    ],
+    "n_samples": 9000,
+    "n_positive": 230
+  },
+  {
+    "model": "XGBoost (default 0.5 threshold)",
+    "threshold": 0.5,
+    "roc_auc": 0.7113137672896733,
+    "pr_auc": 0.14435406786450933,
+    "precision": 1.0,
+    "recall": 0.09130434782608696,
+    "f1": 0.16733067729083664,
+    "confusion_matrix": [
+      [
+        8770,
+        0
+      ],
+      [
+        209,
+        21
+      ]
+    ],
+    "n_samples": 9000,
+    "n_positive": 230
+  }
+]
