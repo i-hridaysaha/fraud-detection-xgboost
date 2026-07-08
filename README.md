@@ -8,6 +8,32 @@ This repo demonstrates the full lifecycle: data → leakage-safe feature
 engineering → imbalance handling → model comparison → threshold tuning →
 SHAP explainability → API serving → drift monitoring.
 
+## Results
+
+Results below are on synthetic data (see [Data](#about-the-data) section) — the
+PCA-style features are randomly generated with only a modest fraud/legit
+signal, which caps absolute precision. The pipeline's design (leakage-safe
+splits, causal features, threshold tuning, SHAP) is what should be evaluated
+here; running the same code on the real Kaggle dataset (see below) would be
+expected to yield meaningfully stronger separation, since real fraud leaves a
+much stronger signal in the underlying PCA components than this synthetic
+approximation does.
+
+![SHAP Summary](reports/shap_summary.png)
+
+| Model | ROC-AUC | PR-AUC | Precision | Recall | F1 |
+|---|---|---|---|---|---|
+| Logistic Regression | 0.542 | 0.101 | 0.026 | 0.465 | 0.050 |
+| Random Forest | 0.756 | 0.127 | 0.050 | 0.697 | 0.093 |
+| XGBoost (tuned threshold, F1-optimal) | 0.723 | 0.110 | 0.067 | 0.242 | 0.105 |
+| XGBoost (default 0.5 threshold) | 0.723 | 0.110 | 0.052 | 0.560 | 0.095 |
+
+**Reading these results:** XGBoost gives the best PR-AUC/F1 tradeoff overall.
+Random Forest achieves the highest recall (catches 70% of fraud) at the cost
+of a very high false-positive rate — illustrating the precision/recall
+tradeoff a real fraud team would tune based on analyst review capacity, which
+is exactly what the threshold-tuning logic in `src/imbalance.py` is for.
+
 ## Why this isn't "just call `.fit()`"
 
 Fraud detection has a few properties that make naive ML approaches actively
