@@ -10,14 +10,15 @@ SHAP explainability → API serving → drift monitoring.
 
 ## Results
 
-Results below are on synthetic data (see [Data](#about-the-data) section) — the
-PCA-style features are randomly generated with only a modest fraud/legit
-signal, which caps absolute precision. The pipeline's design (leakage-safe
-splits, causal features, threshold tuning, SHAP) is what should be evaluated
-here; running the same code on the real Kaggle dataset (see below) would be
-expected to yield meaningfully stronger separation, since real fraud leaves a
-much stronger signal in the underlying PCA components than this synthetic
-approximation does.
+**These numbers are a ceiling test on synthetic data, not a claim about
+real-world performance.** The PCA-style features here are randomly
+generated with only a modest, artificial fraud/legit shift baked in — real
+transaction data carries far more genuine separating signal than this
+placeholder does. What this section demonstrates is that the *pipeline*
+correctly handles imbalance, tunes a threshold on validation (never test),
+and produces model comparisons that behave the way you'd expect (Random
+Forest trading precision for recall, XGBoost giving the best balance) —
+not an absolute performance benchmark.
 
 ![SHAP Summary](reports/shap_summary.png)
 
@@ -33,6 +34,15 @@ Random Forest achieves the highest recall (catches 70% of fraud) at the cost
 of a very high false-positive rate — illustrating the precision/recall
 tradeoff a real fraud team would tune based on analyst review capacity, which
 is exactly what the threshold-tuning logic in `src/imbalance.py` is for.
+
+> **Note on scope:** This is a public recreation of a fraud-detection
+> methodology I've applied professionally in production (leakage-safe time
+> splits, causal feature engineering, imbalance handling, SHAP
+> explainability, real-time serving). It runs on synthetic public data,
+> since real production fraud data is proprietary and can't be shared — so
+> the metrics below reflect what's achievable on an artificially-signaled
+> public dataset, not a production deployment. The value of this repo is
+> the *pipeline design*, not the specific numbers.
 
 ## Why this isn't "just call `.fit()`"
 
@@ -143,6 +153,11 @@ strictly before each transaction's timestamp):
 | `merchant_category_risk_score` | Same, aggregated at the merchant-category level (groceries vs. crypto exchange vs. gambling, etc.). |
 | `is_new_device` | Whether this is a device not previously seen for this customer (as of this point in time). |
 | `distinct_device_count_so_far` | Running count of distinct devices used by this customer. |
+
+*Note: this recreation implements velocity, recency, merchant-risk, and
+device-consistency features. Geo-mismatch and graph-based merchant-user
+linkage features (also used in the production system this recreates) are
+not yet implemented here — see "Known limitations" below.*
 
 ## Imbalance handling
 
