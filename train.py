@@ -7,7 +7,10 @@ train.py — end-to-end training pipeline:
   5. Tune decision threshold on validation set
   6. Evaluate all models on held-out test set
   7. Generate SHAP explainability report
-  8. Persist model artifacts for serving (see src/api.py)
+  8. Log the run + register the model to the MLflow model registry
+     (data fingerprint, metrics, threshold, feature list) — the registry, not
+     the joblib files, is the source of truth for serving (see src/registry.py
+     and src/api.py). The joblib dumps are kept as a thin compatibility shim.
 
 Run:
     python train.py --data data/transactions.csv --imbalance_strategy class_weight
@@ -19,12 +22,13 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from src.config import DATA, PATHS, IMBALANCE
+from src.config import DATA, PATHS, IMBALANCE, REGISTRY, MODEL
 from src.data_loader import load_raw, time_based_split
 from src.feature_engineering import build_feature_pipeline, get_feature_columns
 from src.imbalance import get_class_weight_ratio, apply_smote, tune_threshold_for_f1
 from src.models import build_logistic_regression, build_random_forest, build_xgboost
 from src.evaluate import evaluate_model, compare_models
+from src import registry
 
 
 def main():
@@ -32,6 +36,12 @@ def main():
     parser.add_argument("--data", type=str, default=DATA.raw_path)
     parser.add_argument("--imbalance_strategy", type=str, default="class_weight",
                          choices=["class_weight", "smote", "none"])
+    parser.add_argument("--no_promote", action="store_true",
+                         help="Register the new version to Staging only; do not "
+                              "auto-promote to Production even if there is no "
+                              "current champion. Promotion is normally a gated "
+                              "decision (see src/retraining.py); this flag just "
+                              "controls the first-ever bootstrap.")
     args = parser.parse_args()
 
     os.makedirs(PATHS.model_dir, exist_ok=True)
@@ -128,7 +138,54 @@ def main():
     print(top_features.to_string(index=False))
     top_features.to_csv("reports/shap_top_features.csv", index=False)
 
-    print("\nDone. Artifacts saved to models/ and reports/.")
+    # ---- 8. Register the model in the MLflow registry ----
+    # The registry is the source of truth for serving: it versions the model
+    # together with the exact threshold, feature list, encoders, metrics, and a
+    # fingerprint of the training data, so any served model traces back to the
+    # precise rows and config that produced it.
+    print("\nLogging run + registering model to the MLflow registry...")
+    xgb_tuned_metrics = {
+        k: results[2][k] for k in ("roc_auc", "pr_auc", "precision", "recall", "f1")
+    }
+    fingerprint = registry.data_fingerprint(df)
+    params = {
+        "imbalance_strategy": args.imbalance_strategy,
+        "seed": DATA.random_state,
+        "tuned_threshold": best_threshold,
+        "scale_pos_weight": round(float(xgb_scale_pos_weight), 4),
+        "feature_cols": feature_cols,
+        "xgb": {k: MODEL.xgb_params[k] for k in
+                ("n_estimators", "max_depth", "learning_rate", "subsample",
+                 "colsample_bytree", "min_child_weight", "gamma",
+                 "reg_alpha", "reg_lambda")},
+    }
+    version = registry.log_training_run(
+        model=xgb,
+        feature_cols=feature_cols,
+        threshold_info=threshold_info,
+        metrics=xgb_tuned_metrics,
+        params=params,
+        merchant_risk_maps=risk_maps,
+        device_map=device_map,
+        fingerprint=fingerprint,
+        run_name=f"train_{args.imbalance_strategy}",
+    )
+    print(f"Registered {REGISTRY.registered_model_name} version {version} "
+          f"in stage '{REGISTRY.staging_stage}'. Data fingerprint: {fingerprint}")
+
+    # Bootstrap: if there is no champion yet, the first registered model becomes
+    # Production. Subsequent promotions go through the gated champion/challenger
+    # flow in src/retraining.py — never auto-promoted here.
+    if not args.no_promote and registry.get_production_version() is None:
+        registry.promote_to_production(version)
+        print(f"No existing champion; promoted version {version} to "
+              f"'{REGISTRY.production_stage}' (bootstrap).")
+    else:
+        print("An existing champion is in Production (or --no_promote set); "
+              "left the new version in Staging. Promotion is gated — see "
+              "src/retraining.py / the retraining demo.")
+
+    print("\nDone. Model registered; artifacts saved to models/ and reports/.")
 
 
 if __name__ == "__main__":

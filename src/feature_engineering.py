@@ -148,9 +148,14 @@ def add_device_consistency(df: pd.DataFrame, known_devices: dict) -> pd.DataFram
     return df
 
 
-def build_feature_pipeline(train_df, val_df, test_df):
+def build_feature_pipeline(train_df, val_df, test_df, persist: bool = True):
     """Fits leakage-safe encoders on train only, then applies feature
     engineering consistently across train/val/test.
+
+    `persist` writes the fitted encoders to the fixed joblib paths (the legacy
+    compatibility shim). A challenger retrain (src/retraining.py) sets
+    persist=False so it doesn't clobber the champion's on-disk artifacts — the
+    registry is the source of truth for a challenger, not models/.
     """
     risk_maps = fit_merchant_risk_map(train_df)
     device_map = fit_device_map(train_df)
@@ -164,8 +169,9 @@ def build_feature_pipeline(train_df, val_df, test_df):
         d = add_device_consistency(d, device_map)
         processed[name] = d
 
-    joblib.dump(risk_maps, PATHS.merchant_risk_map_path)
-    joblib.dump(device_map, PATHS.device_map_path)
+    if persist:
+        joblib.dump(risk_maps, PATHS.merchant_risk_map_path)
+        joblib.dump(device_map, PATHS.device_map_path)
 
     return processed["train"], processed["val"], processed["test"], risk_maps, device_map
 

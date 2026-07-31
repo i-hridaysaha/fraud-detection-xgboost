@@ -36,15 +36,15 @@ Example request (store-backed):
 import time
 from contextlib import asynccontextmanager
 
-import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Dict, Optional
 
-from src.config import PATHS, FEATURES
+from src.config import FEATURES, REGISTRY
 from src.explainability import explain_single_transaction
 from src.online_features import MerchantRisk, get_feature_store
+from src import registry
 
 # ---- artifacts + online store, loaded once at startup (see lifespan) ----
 _model = None
@@ -54,22 +54,36 @@ _merchant_risk_maps = None
 _device_map = None
 _explainer = None
 _feature_store = None
+_model_version = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model artifacts and construct the online feature store once, at
-    process start. Replaces the deprecated @app.on_event("startup") hook with
-    the supported lifespan handler.
+    """Load the CURRENT PRODUCTION model from the model registry, and construct
+    the online feature store, once at process start.
+
+    The model is resolved BY STAGE (`Production`) from the MLflow registry — not
+    from a hardcoded joblib path — together with the exact threshold, feature
+    list, and encoders that were registered alongside it. This guarantees the
+    served threshold and feature order always match the served model.
+
+    How a new Production promotion is picked up: at STARTUP. Promoting a new
+    champion (src/retraining.py) and restarting the API (or its workers) is what
+    ships it. A running process keeps serving the version it loaded — a
+    deliberate, safe default: no mid-flight model swaps under load. A real
+    deployment would trigger a rolling restart on promotion (or add a guarded
+    hot-reload endpoint); noted here rather than hidden.
     """
     global _model, _feature_cols, _threshold_info, _merchant_risk_maps
-    global _device_map, _explainer, _feature_store
+    global _device_map, _explainer, _feature_store, _model_version
 
-    _model = joblib.load(PATHS.xgb_model_path)
-    _feature_cols = joblib.load(PATHS.feature_list_path)
-    _threshold_info = joblib.load(PATHS.threshold_path)
-    _merchant_risk_maps = joblib.load(PATHS.merchant_risk_map_path)
-    _device_map = joblib.load(PATHS.device_map_path)
+    bundle = registry.load_bundle(stage=REGISTRY.production_stage)
+    _model = bundle["model"]
+    _feature_cols = bundle["feature_cols"]
+    _threshold_info = bundle["threshold_info"]
+    _merchant_risk_maps = bundle["merchant_risk_maps"]
+    _device_map = bundle["device_map"]
+    _model_version = bundle["version"]
 
     # TreeExplainer is cheap relative to scoring volume; build once and cache.
     import shap
@@ -79,7 +93,9 @@ async def lifespan(app: FastAPI):
     # Reuse the already-loaded merchant-risk map rather than loading it twice.
     _feature_store = get_feature_store(merchant_risk=MerchantRisk(_merchant_risk_maps))
 
-    print("Model, feature list, threshold, encoders, and feature store loaded.")
+    print(f"Loaded {REGISTRY.registered_model_name} v{_model_version} "
+          f"(stage={REGISTRY.production_stage}) from the registry, plus feature "
+          f"list, threshold, encoders, and feature store.")
     yield
     # nothing to tear down explicitly; Redis connections are pooled
 
@@ -233,4 +249,9 @@ def ingest_transaction(req: IngestRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": _model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": _model is not None,
+        "model_version": _model_version,      # which registry version is serving
+        "model_stage": REGISTRY.production_stage,
+    }

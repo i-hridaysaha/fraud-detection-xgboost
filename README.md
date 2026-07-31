@@ -6,7 +6,9 @@ designed for the scale and constraints of a real payments environment
 
 This repo demonstrates the full lifecycle: data → leakage-safe feature
 engineering → imbalance handling → model comparison → threshold tuning →
-SHAP explainability → API serving → drift monitoring.
+SHAP explainability → API serving → drift monitoring → **a versioned model
+registry, a running monitoring service, and gated champion/challenger retraining**
+(see [Model lifecycle](#model-lifecycle)).
 
 ## Results
 
@@ -72,11 +74,19 @@ fraud_detection_platform/
 │   ├── evaluate.py              # precision/recall/F1/AUC reporting
 │   ├── explainability.py        # SHAP (global + per-transaction)
 │   ├── online_features.py       # real-time streaming feature store (Redis + in-memory)
-│   ├── api.py                   # FastAPI real-time scoring service
-│   └── monitoring.py            # PSI-based data drift + delayed performance tracking
+│   ├── api.py                   # FastAPI real-time scoring service (loads Production from registry)
+│   ├── monitoring.py            # PSI-based data drift + delayed performance functions
+│   ├── monitoring_service.py    # scheduled monitoring: runs the checks, persists history, alerts
+│   ├── registry.py              # MLflow model registry: version, stage, promote, rollback
+│   ├── training_core.py         # the one reusable "train the XGBoost model" definition
+│   └── retraining.py            # should_retrain, champion/challenger gate, rollback, orchestrator
+├── scripts/
+│   └── simulate_decay_demo.py   # end-to-end simulated-decay lifecycle walkthrough
+├── mlruns/                       # local MLflow tracking + registry file store (gitignored)
 ├── tests/
 │   ├── test_pipeline.py         # leakage/sanity tests
-│   └── test_streaming_parity.py # proves online features == batch features
+│   ├── test_streaming_parity.py # proves online features == batch features
+│   └── test_lifecycle.py        # retraining trigger, gate, promote/rollback, monitoring
 ├── loadtest/                    # concurrency load test + real latency results
 │   ├── loadtest.py              # asyncio+httpx scripted runner
 │   ├── locustfile.py            # interactive Locust runner
@@ -126,12 +136,14 @@ pip install -r requirements.txt
 # 1. Generate data (or supply your own transactions.csv — see above)
 python data/generate_synthetic_data.py --n_rows 500000 --fraud_rate 0.0017
 
-# 2. Train all three models, evaluate, and generate SHAP report
+# 2. Train, evaluate, generate SHAP, and register the model to the local
+#    MLflow registry (file store under ./mlruns). The first model is
+#    auto-promoted to Production (the champion).
 python train.py --imbalance_strategy class_weight
 #    (or --imbalance_strategy smote / none)
 
-# 3. Serve the trained XGBoost model
-#    (in-memory feature store, no infra needed)
+# 3. Serve the CURRENT PRODUCTION model — resolved from the registry by stage,
+#    not a hardcoded path (in-memory feature store, no infra needed)
 FEATURE_STORE_BACKEND=memory uvicorn src.api:app --host 0.0.0.0 --port 8000
 #    ...or Redis-backed API + Redis together:
 docker compose up --build
@@ -139,7 +151,14 @@ docker compose up --build
 # 4. Run tests
 pytest tests/ -v
 
-# 5. Load test the store-backed /score path (writes loadtest/results.md)
+# 5. Watch the whole lifecycle fire on a simulated concept-drift event:
+#    decay detected -> challenger trained -> gate accepts, then rejects -> rollback
+python scripts/simulate_decay_demo.py
+
+# 6. (optional) Browse the registry / experiment runs in the MLflow UI
+mlflow ui --backend-store-uri ./mlruns      # then open http://localhost:5000
+
+# 7. Load test the store-backed /score path (writes loadtest/results.md)
 python loadtest/loadtest.py --host http://localhost:8000
 ```
 
@@ -273,7 +292,126 @@ run, not hand-written.
 different responses:
 
 - **Data drift** (`compute_feature_drift_report`, `compute_prediction_drift`): Population Stability Index per feature and on the model's output score distribution. Available immediately, no ground truth needed. PSI < 0.1 stable, 0.1-0.25 investigate, > 0.25 significant shift.
-- **Concept drift / performance decay** (`compute_delayed_performance_report`): recomputes precision/recall/F1 once delayed ground-truth labels (chargebacks, confirmed fraud reports) arrive for a past batch, run as a scheduled job. This is the actual retraining trigger — data drift alone doesn't necessarily mean the model got worse.
+- **Concept drift / performance decay** (`compute_delayed_performance_report`): recomputes precision/recall/F1 once delayed ground-truth labels (chargebacks, confirmed fraud reports) arrive for a past batch. This is the primary retraining trigger — data drift alone doesn't necessarily mean the model got worse.
+
+`src/monitoring.py` holds the *functions*; `src/monitoring_service.py` is what actually **runs** them on a cadence, persists a timestamped history under `reports/monitoring/`, and alerts. See the **Model lifecycle** section below for how those signals drive registry-gated retraining.
+
+## Model lifecycle
+
+Training a model once and dumping a `.joblib` is where most demos stop. Operating
+a fraud model means *running* the loop that keeps it honest after deployment:
+versioning what ships, watching it decay, and retraining under a gate that
+refuses to promote a worse model. That loop is what this section describes. It is
+entirely local — an MLflow **file store** under `./mlruns`, JSON-Lines history
+under `reports/monitoring/`, no server and no cloud.
+
+### 1. Registry (`src/registry.py`)
+
+Every training run logs to MLflow and registers the model under **`fraud_xgb`**,
+carrying — as versioned artifacts — the exact **threshold**, **feature list**,
+**merchant-risk encoders**, held-out **metrics** (ROC-AUC / PR-AUC / precision /
+recall / F1), and a **data fingerprint** (row count + SHA-256 of the sorted row
+keys + date range) so any registered model traces back to the precise rows and
+config that produced it. Two **stages** are used:
+
+| Stage | Meaning |
+|---|---|
+| `Staging` | a freshly trained or challenger version, not yet serving |
+| `Production` | the single version the API serves right now — the **champion** |
+
+`promote_to_production(v)` moves a version to Production and archives the
+incumbent (so "what are we serving?" is never ambiguous); `rollback_to_version(v)`
+is just promoting a known-good older version back. `train.py` auto-promotes the
+*first* model (bootstrap); after that, promotion is a **gated** decision, never
+automatic.
+
+> MLflow is pinned to 2.x on purpose: we use registry **stages** and the local
+> **file store**, both of which MLflow 3 deprecates (3.x replaces stages with
+> aliases and puts the file backend in maintenance mode).
+
+### 2. Serving from the registry (`src/api.py`)
+
+The API loads the **Production-stage** model at startup — resolved *by stage*,
+not a hardcoded artifact path — together with the threshold and feature list that
+were registered with it, so the served threshold always matches the served model.
+The `/score` response schema is unchanged; `/health` now also reports the serving
+`model_version`. **A new promotion is picked up on restart** (a deliberate, safe
+default — no mid-flight model swaps under load; a real deployment would do a
+rolling restart on promotion, or add a guarded hot-reload endpoint).
+
+### 3. Monitoring cadence (`src/monitoring_service.py`)
+
+`run_monitoring_cycle()` runs each cycle (default **hourly**, `MONITORING.interval_seconds`):
+per-feature **PSI** and **prediction-score PSI** against the stored training
+reference, persisted to `reports/monitoring/drift_history.jsonl`. A separate
+delayed-labels job (`run_delayed_performance_cycle()`) recomputes realized
+precision/recall/F1 as ground truth arrives, to `performance_history.jsonl`. The
+two alerts are kept **distinct** because they mean different things:
+
+- **DRIFT** alert — inputs/scores shifted (≥ `min_significant_features` in the
+  significant PSI band, or the score distribution shifts). Investigate; maybe an
+  early retrain.
+- **DECAY** alert — realized F1/recall fell below its floor. The model actually
+  got worse. Retrain.
+
+Alerts emit a structured log line, plus a webhook POST **only if** you set
+`FRAUD_ALERT_WEBHOOK` (never a hardcoded endpoint).
+
+### 4. Retraining policy + the gate (`src/retraining.py`)
+
+`should_retrain(...)` is an explicit, config-driven policy that returns **why**,
+not just a bool:
+
+| Trigger | Condition | Thresholds (`src/config.py :: RETRAIN`) |
+|---|---|---|
+| **decay** (primary) | realized F1 below floor **or** dropped sharply vs the training baseline | `decay_f1_abs_floor=0.05`, `decay_f1_relative_drop=0.25` |
+| **drift** (secondary/early) | significant drift **sustained** across cycles | `drift_sustained_cycles=2`, `drift_min_significant_features=3` |
+
+On trigger, a **challenger** is trained on the newer data window — via the exact
+same leakage-safe pipeline (`src/training_core.py`) as the champion — and
+registered to `Staging`. The **gate** then compares challenger vs champion on a
+common, chronologically-held-out test split, on **PR-AUC** (the metric that
+matters under extreme imbalance), and promotes the challenger **only if it beats
+the champion by ≥ `promotion_min_pr_auc_gain` (0.005)**. Otherwise the champion
+keeps serving and the challenger is logged as rejected. **The gate is the point:
+never auto-promote a worse model.** `run_retraining_flow(...)` orchestrates the
+whole thing — `monitor → detect → retrain → evaluate → gated promote/reject →
+record` — as a plain Python function; in a real deployment each step would be a
+task in Airflow / Prefect / Kubeflow (noted in the code).
+
+### Simulated-decay demo — the loop firing end to end
+
+Absolute scores on the synthetic data are weak by construction (see
+[Results](#results)); the point here is the **lifecycle mechanics**, demonstrated
+by injecting a **clearly-labelled simulated** concept-drift event (fraud moves to
+different PCA components; old ones scrambled; amount inflation) into a recent data
+window and watching the machinery react:
+
+```bash
+python scripts/simulate_decay_demo.py
+```
+
+Real output from a run (trimmed):
+
+```
+2. DRIFT check:  drift_alert=True | 7 features in significant PSI band:
+                 ['V7','V9','V24','V20','V22','Amount']... | score PSI=0.1953
+3. DECAY check:  decay_alert=True | realized: precision=0.0220 recall=0.2699 F1=0.0407
+4. should_retrain=True triggers=['decay','drift'] severity=critical
+     - realized F1 0.0407 below absolute floor 0.05
+     - realized F1 0.0407 is 41% below training baseline 0.0685 (> 25% allowed)
+     - significant drift sustained 2 consecutive cycles, 7 features shifted
+5. GATE (accept):  champion pr_auc=0.01827 vs challenger 0.95134
+                   (gain +0.933, margin 0.005) -> PROMOTE_CHALLENGER
+6. GATE (reject):  champion pr_auc=0.98598 vs stale challenger 0.01918
+                   (gain -0.967, margin 0.005) -> KEEP_CHAMPION
+7. ROLLBACK:       Production v3 -> v2 (verified)
+```
+
+Step 5 shows the gate **accepting** a genuinely better challenger; step 6 shows it
+**rejecting** an inferior one (a challenger accidentally trained on the stale
+regime) — both directions, on real trained models. Step 7 shows a one-call
+rollback. The realized numbers above come from an actual run, not hand-written.
 
 ## Known limitations / next steps for a real deployment
 
@@ -281,3 +419,6 @@ different responses:
 - The batch pipeline (`src/feature_engineering.py`) remains the source of truth for feature definitions during training. The live serving path uses the streaming aggregator in `src/online_features.py` (see [Real-time feature store](#real-time-feature-store)), kept in lockstep with batch by `tests/test_streaming_parity.py`. A full production deployment would back it with a managed Redis (or Flink/Kafka Streams for very high fan-in) rather than a single node.
 - No hyperparameter search is included (fixed, reasonable XGBoost defaults are used) — wire in Optuna/Ray Tune before treating this as final.
 - No formal model card / bias audit across customer segments is included — worth adding before production use in a regulated environment.
+- The champion/challenger gate scores both models on a common test set encoded with the *challenger's* feature encoders (merchant-risk map fit on the challenger window), not a from-scratch re-featurization per model. Both models see the identical matrix, so the comparison *between them* is fair; this is flagged in `src/retraining.py` rather than hidden. A fuller setup would re-featurize the common test through each model's own encoders.
+- The decay in the demo is a **deliberately injected, clearly-labelled simulated** concept shift, used only to exercise the trigger/gate/rollback mechanics end-to-end — not a claim about real fraud drift magnitudes.
+- Model promotion is picked up by the API on **restart**. There is no hot-reload endpoint or automated rolling restart wired in — noted in `src/api.py`.
