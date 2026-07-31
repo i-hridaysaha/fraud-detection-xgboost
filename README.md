@@ -305,6 +305,38 @@ refuses to promote a worse model. That loop is what this section describes. It i
 entirely local — an MLflow **file store** under `./mlruns`, JSON-Lines history
 under `reports/monitoring/`, no server and no cloud.
 
+```mermaid
+flowchart TD
+    D["Transactions"] --> FE["Leakage-safe<br/>feature engineering"]
+    FE --> TR["Train XGBoost<br/>+ tune threshold"]
+    TR --> REG[("MLflow registry<br/>fraud_xgb")]
+    REG -->|Production stage| API["Scoring API<br/>POST /score"]
+    API --> LOGS["Scores +<br/>delayed labels"]
+
+    subgraph MON["Monitoring service (scheduled)"]
+      LOGS --> PSI["Feature + score PSI"]
+      LOGS --> PERF["Delayed performance"]
+      PSI --> DA{"DRIFT alert"}
+      PERF --> CA{"DECAY alert"}
+    end
+
+    DA --> SR["should_retrain<br/>(with reasons)"]
+    CA --> SR
+    SR -->|trigger| CH["Train challenger<br/>on recent window"]
+    CH --> REG
+    CH --> GATE{"Gate: challenger PR-AUC<br/>≥ champion + margin?"}
+    REG -.->|champion| GATE
+    GATE -->|yes| PROMO["Promote challenger<br/>to Production"]
+    GATE -->|no| KEEP["Keep champion,<br/>log rejected"]
+    PROMO --> REG
+    REG -.->|misbehaves| RB["Rollback to<br/>prior version"]
+    RB --> REG
+```
+
+The four numbered pieces below map onto that diagram: the **registry** (center),
+**serving** (top-right), the **monitoring service** (the scheduled box), and the
+**retraining trigger + gate** (bottom).
+
 ### 1. Registry (`src/registry.py`)
 
 Every training run logs to MLflow and registers the model under **`fraud_xgb`**,
@@ -318,6 +350,16 @@ config that produced it. Two **stages** are used:
 |---|---|
 | `Staging` | a freshly trained or challenger version, not yet serving |
 | `Production` | the single version the API serves right now — the **champion** |
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Staging: register (train or challenger)
+    Staging --> Production: promote (gate passes / bootstrap)
+    Production --> Archived: superseded by new champion
+    Archived --> Production: rollback
+    Staging --> Staging: rejected challenger stays here
+```
 
 `promote_to_production(v)` moves a version to Production and archives the
 incumbent (so "what are we serving?" is never ambiguous); `rollback_to_version(v)`
@@ -378,6 +420,21 @@ never auto-promote a worse model.** `run_retraining_flow(...)` orchestrates the
 whole thing — `monitor → detect → retrain → evaluate → gated promote/reject →
 record` — as a plain Python function; in a real deployment each step would be a
 task in Airflow / Prefect / Kubeflow (noted in the code).
+
+```mermaid
+flowchart LR
+    S["Decay or<br/>sustained drift"] --> R{"should_retrain?"}
+    R -->|no| STOP["Keep champion<br/>(no action)"]
+    R -->|yes| T["Train challenger<br/>on recent window"]
+    T --> E["Score champion vs challenger<br/>on a common held-out test"]
+    E --> G{"challenger PR-AUC<br/>≥ champion + 0.005?"}
+    G -->|yes| P["Promote challenger<br/>to Production"]
+    G -->|no| K["Reject challenger<br/>(stays in Staging)"]
+    P -.->|if it misbehaves| RB["Rollback"]
+```
+
+The gate is the guardrail: the **only** path from challenger to Production runs
+through the PR-AUC-plus-margin check.
 
 ### Simulated-decay demo — the loop firing end to end
 
