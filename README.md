@@ -71,11 +71,19 @@ fraud_detection_platform/
 │   ├── models.py                # LR / RF / XGBoost factories
 │   ├── evaluate.py              # precision/recall/F1/AUC reporting
 │   ├── explainability.py        # SHAP (global + per-transaction)
+│   ├── online_features.py       # real-time streaming feature store (Redis + in-memory)
 │   ├── api.py                   # FastAPI real-time scoring service
 │   └── monitoring.py            # PSI-based data drift + delayed performance tracking
 ├── tests/
-│   └── test_pipeline.py         # leakage/sanity tests
+│   ├── test_pipeline.py         # leakage/sanity tests
+│   └── test_streaming_parity.py # proves online features == batch features
+├── loadtest/                    # concurrency load test + real latency results
+│   ├── loadtest.py              # asyncio+httpx scripted runner
+│   ├── locustfile.py            # interactive Locust runner
+│   └── results.md               # actual RPS + p50/p95/p99 from a real run
 ├── train.py                     # end-to-end training entry point
+├── Dockerfile
+├── docker-compose.yml           # Redis + API together
 ├── requirements.txt
 └── reports/                     # generated metrics + SHAP plots land here
 ```
@@ -123,10 +131,16 @@ python train.py --imbalance_strategy class_weight
 #    (or --imbalance_strategy smote / none)
 
 # 3. Serve the trained XGBoost model
-uvicorn src.api:app --host 0.0.0.0 --port 8000
+#    (in-memory feature store, no infra needed)
+FEATURE_STORE_BACKEND=memory uvicorn src.api:app --host 0.0.0.0 --port 8000
+#    ...or Redis-backed API + Redis together:
+docker compose up --build
 
 # 4. Run tests
 pytest tests/ -v
+
+# 5. Load test the store-backed /score path (writes loadtest/results.md)
+python loadtest/loadtest.py --host http://localhost:8000
 ```
 
 ## Feature engineering
@@ -167,16 +181,91 @@ Decision threshold is tuned on the **validation set only** (`src/imbalance.py::t
 - **Global**: `reports/shap_summary.png` and `reports/shap_top_features.csv` — which features drive the model overall (for model governance / validation review).
 - **Local**: `explain_single_transaction()` — surfaces the top contributing factors for one transaction, returned directly in the `/score` API response when `explain: true` is passed. This is what a fraud analyst's alert-triage UI would show.
 
+## Real-time feature store
+
+The velocity/recency/device features are cheap to compute in batch over a whole
+DataFrame but impossible to recompute per-request at 1M+ txns/day. `src/online_features.py`
+is the online counterpart: a **stateful streaming aggregator** that maintains
+per-customer state incrementally and serves the exact same features the batch
+pipeline produces.
+
+**Two-phase, causal contract.** Every transaction is handled in two steps:
+
+```python
+feats = store.get_features(txn)   # state AS OF NOW, excluding this txn
+# ...score the model...
+store.commit(txn)                 # fold this txn in, for FUTURE txns
+```
+
+`get_features` never sees the current transaction in its own state — velocity
+excludes the current row, `is_new_device` is evaluated against prior devices
+only — exactly mirroring the batch semantics (which get the same guarantee from
+sort + shift). `commit` is what makes a transaction count for the *next* one.
+This ordering is the causality guarantee; scoring always happens before the
+commit.
+
+**Redis data structures** (per `customer_id`):
+
+| Key | Type | Purpose |
+|---|---|---|
+| `fs:vel:{cid}` | **sorted set**, score = txn epoch seconds | Sliding-window velocity. `ZRANGEBYSCORE (now-w, now]` gives a window's events in `O(log N + K)`; `ZREMRANGEBYSCORE` ages out anything past the largest window. Member is `"{epoch}|{amount}|{txn_id}"` so amounts are recoverable for windowed sums and members stay unique. |
+| `fs:last:{cid}` | string | Last txn epoch → `seconds_since_last_txn` (large sentinel, never 0, on first-ever txn). |
+| `fs:dev:{cid}` | set | Distinct device ids → `is_new_device` + `distinct_device_count_so_far`. |
+
+A time-scored sorted set *is* a sliding window: old events age out with one
+range delete and any window (10m/60m/1440m) is a single range query. TTLs keep
+memory bounded for dormant customers. Commits run inside a `MULTI` pipeline so
+concurrent workers can't interleave a partial update. Merchant risk is a static
+offline lookup (from `merchant_risk_map.joblib`), not streaming state, so it
+stays a plain dict lookup.
+
+**In-memory fallback.** `InMemoryFeatureStore` implements the same interface
+(with a per-customer lock) so the repo runs and all tests pass with **no Redis
+server**. Select the backend with `FEATURE_STORE_BACKEND=redis|memory` and
+`REDIS_URL`.
+
+**Train/serve parity — the guardrail.** `tests/test_streaming_parity.py` runs a
+fixed transaction stream through *both* the batch pipeline and the streaming
+store and asserts the feature rows are identical (both backends). This is the
+proof that the serving path didn't silently drift from what the model was
+trained on. Batch and streaming reference a single definition of the window
+widths and the first-txn sentinel (`src/feature_engineering.py`) rather than two
+copies.
+
 ## Deployment
 
-`src/api.py` is a FastAPI service exposing `POST /score`. It expects
-pre-computed streaming features (velocity, recency, device flags) in the
-request — in a real deployment these come from a streaming feature store
-(e.g. Feast, Flink, or a Kafka-backed aggregator) updated in real time, not
-computed from scratch per-request, since velocity features require
-historical context the API itself doesn't hold.
+`src/api.py` is a FastAPI service exposing `POST /score`, with two ways to
+supply the time-dependent features:
 
-Also included: `GET /health` for liveness/readiness probes.
+- **Store-backed** (`"use_feature_store": true`): the service fetches
+  velocity/recency/device features from the online store above using the
+  transaction's ids; the caller passes only the raw txn fields (V1-V28, Amount,
+  ids, timestamp). Set `"ingest": true` to commit the txn after scoring.
+- **Caller-provided** (default): the caller passes all features pre-computed —
+  the original contract, kept for backward compatibility.
+
+`POST /ingest` folds a transaction into the store without scoring (warmup /
+backfill). `GET /health` is for liveness/readiness probes.
+
+Bring up Redis + the API together with `docker compose up --build`.
+
+### Load test / latency
+
+`loadtest/` drives concurrent store-backed `/score` requests after warming the
+store with realistic per-customer history. On an **Apple M4 laptop, single
+uvicorn worker, in-memory backend**, the measured result over 20,000 requests
+(warm store, concurrency 8) was:
+
+| Throughput | p50 | p95 | p99 | errors |
+|---|---|---|---|---|
+| **435 RPS** | 18.1 ms | 24.2 ms | **27.8 ms** | 0 |
+
+p99 well under the 100ms target. Throughput is bounded by a single CPU-bound
+Python worker; the production config (N workers + Redis for shared state, via
+`docker-compose.yml`) scales RPS roughly linearly across cores. Full numbers,
+the concurrency sweep, and the scaling analysis are in
+[loadtest/results.md](loadtest/results.md) — every number there is from a real
+run, not hand-written.
 
 ## Monitoring
 
@@ -189,6 +278,6 @@ different responses:
 ## Known limitations / next steps for a real deployment
 
 - The synthetic data generator's fraud/legit separation is simplified; a real deployment would validate against confirmed fraud investigation outcomes, not just PR-AUC on a held-out set.
-- `is_new_device`/velocity features are computed here via a Python loop over the whole dataset for clarity — at 1M+ transactions/day this logic should move to a streaming aggregation layer (Flink/Kafka Streams) rather than being recomputed in batch.
+- The batch pipeline (`src/feature_engineering.py`) remains the source of truth for feature definitions during training. The live serving path uses the streaming aggregator in `src/online_features.py` (see [Real-time feature store](#real-time-feature-store)), kept in lockstep with batch by `tests/test_streaming_parity.py`. A full production deployment would back it with a managed Redis (or Flink/Kafka Streams for very high fan-in) rather than a single node.
 - No hyperparameter search is included (fixed, reasonable XGBoost defaults are used) — wire in Optuna/Ray Tune before treating this as final.
 - No formal model card / bias audit across customer segments is included — worth adding before production use in a regulated environment.

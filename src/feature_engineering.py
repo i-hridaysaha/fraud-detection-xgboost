@@ -24,6 +24,23 @@ import sys
 sys.path.append(".")
 from src.config import FEATURES, PATHS
 
+# Single source of truth for the two definitions the online (streaming) feature
+# store must reproduce exactly. Both the batch pipeline below and
+# src/online_features.py import these so the two paths can never silently drift.
+#
+# FIRST_TXN_SENTINEL: a customer's first-ever transaction has no prior history,
+# so seconds_since_last_txn gets a large value (not 0 — 0 would falsely read as
+# "just transacted a moment ago").
+FIRST_TXN_SENTINEL = 1e6
+
+
+def velocity_window_seconds() -> dict:
+    """Maps each configured velocity window (in minutes) to its width in
+    seconds. Kept here, next to the batch rolling logic, so the streaming
+    aggregator windows against identical boundaries.
+    """
+    return {w: w * 60 for w in FEATURES.velocity_windows_minutes}
+
 
 def add_time_since_last_transaction(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["customer_id", "timestamp"]).reset_index(drop=True)
@@ -33,7 +50,7 @@ def add_time_since_last_transaction(df: pd.DataFrame) -> pd.DataFrame:
     )
     # First-ever transaction for a customer: no prior history. Use a large
     # sentinel value rather than 0 (0 would falsely look "just transacted").
-    df["seconds_since_last_txn"] = df["seconds_since_last_txn"].fillna(1e6)
+    df["seconds_since_last_txn"] = df["seconds_since_last_txn"].fillna(FIRST_TXN_SENTINEL)
     df = df.drop(columns=["prev_txn_time"])
     return df
 
