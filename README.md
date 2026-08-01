@@ -8,7 +8,7 @@ environment (1M+ transactions/day, ~0.1–0.3% fraud rate, sub-100ms scoring).
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 
-📄 **Full write-up:** https://www.hridaysaha.com/projects/fraud-detection-platform
+📄 **Full write-up:** https://www.hridaysaha.com/projects-1/fraud-detection-platform
 
 ## Results
 
@@ -21,15 +21,15 @@ environment (1M+ transactions/day, ~0.1–0.3% fraud rate, sub-100ms scoring).
 
 | Model | ROC-AUC | PR-AUC | Precision | Recall | F1 |
 |---|---|---|---|---|---|
-| Logistic Regression | 0.542 | 0.101 | 0.026 | 0.465 | 0.050 |
-| Random Forest | 0.756 | 0.127 | 0.050 | 0.697 | 0.093 |
-| XGBoost (tuned threshold, F1-optimal) | 0.723 | 0.110 | 0.067 | 0.242 | 0.105 |
-| XGBoost (default 0.5 threshold) | 0.723 | 0.110 | 0.052 | 0.560 | 0.095 |
+| Logistic Regression | 0.542 | 0.101 | 0.026 | 0.463 | 0.050 |
+| Random Forest | 0.757 | 0.136 | 0.048 | 0.733 | 0.091 |
+| XGBoost (tuned threshold, F1-optimal) | 0.722 | 0.109 | 0.067 | 0.262 | 0.106 |
+| XGBoost (default 0.5 threshold) | 0.722 | 0.109 | 0.051 | 0.554 | 0.094 |
 
 ![SHAP Summary](reports/shap_summary.png)
 
 XGBoost gives the best PR-AUC/F1 tradeoff overall. Random Forest reaches the
-highest recall (catches ~70% of fraud) at a very high false-positive rate — the
+highest recall (catches ~73% of fraud) at a very high false-positive rate — the
 precision/recall tradeoff a real fraud team tunes against analyst review
 capacity, which is exactly what `src/imbalance.py` exists to control.
 
